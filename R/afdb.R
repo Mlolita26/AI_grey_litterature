@@ -137,7 +137,8 @@ afdb_init_session <- function() {
     Sys.sleep(runif(1, 1.5, 3.0))  # brief pause before first document request
     return(TRUE)
   }
-  cli::cli_alert_warning("Homepage returned HTTP {httr::status_code(resp)} — session may not work")
+  status_str <- if (is.null(resp)) "no response (network error)" else httr::status_code(resp)
+  cli::cli_alert_warning("Homepage returned HTTP {status_str} — continuing anyway (cookies may be missing)")
   FALSE
 }
 
