@@ -2,3 +2,18 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Downloaded PDFs (large binary files)
+downloads/**/*.pdf
+downloads/**/*.PDF
+
+# Generated data files (CSVs with metadata/logs)
+data/*.csv
+logs/*.csv
+
+# Keep placeholder files so folders are tracked in git
+!downloads/.gitkeep
+!data/.gitkeep
+!logs/.gitkeep
+!docs/.gitkeep
+!tests/.gitkeep
