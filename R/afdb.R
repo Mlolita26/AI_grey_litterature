@@ -75,7 +75,15 @@ AFDB_CATEGORIES <- list(
 )
 
 # IDEV evaluation pages (separate Drupal site)
-IDEV_EVALUATIONS_URL <- paste0(IDEV_BASE, "/en/evaluations")
+# Candidate URLs tried in order — 404s are skipped automatically
+IDEV_EVALUATIONS_URLS <- c(
+  paste0(IDEV_BASE, "/en/evaluation"),           # most likely correct path
+  paste0(IDEV_BASE, "/en/evaluations"),
+  paste0(IDEV_BASE, "/evaluations"),
+  paste0(IDEV_BASE, "/en/idev-evaluations"),
+  paste0(IDEV_BASE, "/en/publications"),
+  IDEV_BASE                                       # root page as last resort
+)
 
 # AfDB uses a realistic User-Agent because the site blocks generic bots
 # This is used as an override for polite_get calls on this source
@@ -106,7 +114,9 @@ afdb_get <- function(url) {
         httr::add_headers(
           Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           `Accept-Language` = "en-US,en;q=0.5",
-          `Accept-Encoding` = "gzip, deflate, br"
+          # Omit 'br' (Brotli) — libcurl on Windows does not support it;
+          # without this the server sends Brotli which httr cannot decode.
+          `Accept-Encoding` = "gzip, deflate"
         )
       ),
       error = function(e) {
@@ -253,30 +263,38 @@ scrape_idev <- function() {
   cli::cli_h2("Strategy 1: IDEV Evaluations Portal (idev.afdb.org)")
   all_results <- tibble()
 
+  # Try each candidate URL until one returns 200
+  idev_base_url <- NULL
+  for (candidate in IDEV_EVALUATIONS_URLS) {
+    cli::cli_alert_info("Trying IDEV URL: {candidate}")
+    resp <- afdb_get(candidate)
+    if (!is.null(resp) && httr::status_code(resp) == 200) {
+      idev_base_url <- candidate
+      cli::cli_alert_success("IDEV accessible at: {candidate}")
+      break
+    } else {
+      status <- if (is.null(resp)) "no response" else httr::status_code(resp)
+      cli::cli_alert_warning("  {status} — trying next...")
+    }
+  }
+
+  if (is.null(idev_base_url)) {
+    cli::cli_alert_warning("IDEV portal not accessible — skipping.")
+    return(tibble())
+  }
+
   for (page_num in 0:AFDB_MAX_PAGES) {
-    url <- if (page_num == 0) IDEV_EVALUATIONS_URL else
-      paste0(IDEV_EVALUATIONS_URL, "?page=", page_num)
+    url <- if (page_num == 0) idev_base_url else
+      paste0(idev_base_url, "?page=", page_num)
 
     cli::cli_alert_info("IDEV page {page_num}: {url}")
-
-    # Use standard polite_get for IDEV (different domain, may not block)
-    resp <- polite_get(url)
-    if (is.null(resp) || httr::status_code(resp) != 200) {
-      # Try browser UA
-      page_html <- afdb_read_html(url)
-    } else {
-      page_html <- tryCatch(
-        xml2::read_html(httr::content(resp, as = "text", encoding = "UTF-8")),
-        error = function(e) NULL
-      )
-    }
+    page_html <- afdb_read_html(url)
 
     if (is.null(page_html)) {
       cli::cli_alert_warning("Could not fetch IDEV page {page_num}, stopping.")
       break
     }
 
-    # Parse entries
     records <- parse_afdb_listing(page_html, IDEV_BASE, "Evaluation Report")
 
     if (nrow(records) == 0) {
@@ -284,7 +302,7 @@ scrape_idev <- function() {
       break
     }
 
-    # For IDEV, fix base URL for relative links
+    # Fix relative links to use IDEV base
     records <- records %>%
       mutate(web_url = ifelse(!is.na(web_url) & startsWith(web_url, AFDB_BASE),
                               sub(AFDB_BASE, IDEV_BASE, web_url, fixed = TRUE),
@@ -293,7 +311,6 @@ scrape_idev <- function() {
     all_results <- bind_rows(all_results, records)
     cli::cli_alert_success("IDEV page {page_num}: {nrow(records)} documents found")
 
-    # Check for next page link
     next_link <- rvest::html_element(page_html, "a[rel='next'], .pager__item--next a, li.next a")
     if (is.na(next_link)) break
   }
