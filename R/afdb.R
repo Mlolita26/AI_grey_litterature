@@ -1,38 +1,38 @@
 ##############################################################################
 # afdb.R — African Development Bank (AfDB) Document Scraper
 #
-# Targets:
-#   - Project Completion Reports (PCRs) — AfDB equivalent of World Bank ICRs
-#   - Project Appraisal Reports (PARs)
-#   - Independent evaluations from IDEV (idev.afdb.org)
-#   - Project Completion Report Evaluation Notes (PCRENs)
+# Targets: One document per project (most complete type available) for
+#          Environment and Climate Change sector projects in Africa.
 #
-# Websites:
-#   - Main documents: https://www.afdb.org/en/all-documents
-#   - Category pages: https://www.afdb.org/en/documents/category/{type}
-#   - IDEV evaluations: https://idev.afdb.org/en/evaluations
+# Source: https://www.afdb.org/en/all-documents
+#   Filter: tid_1=89 (Environment), tid_1=98 (Climate Change)
+#   Pagination: ?page=0, ?page=1, ... (18 docs per page)
 #
 # Strategy:
-#   - AfDB uses Drupal CMS with standard ?page=N pagination
-#   - Two scraping strategies run in sequence:
-#     1. IDEV portal (idev.afdb.org) — evaluation reports, more accessible
-#     2. AfDB category pages — PCRs and PARs
-#   - Both strategies parse HTML document listings, follow links to get PDF URLs
-#   - PDFs stored at /fileadmin/uploads/afdb/Documents/... or
-#     idev.afdb.org/sites/default/files/...
+#   1. Scrape sector-filtered document listings (Environment + Climate Change)
+#   2. Parse doc type from title suffix (EER, IPR, PCR, PAR, etc.)
+#   3. Group by project name, keep ONE doc per project (priority ranking)
+#   4. Visit document pages to resolve PDF download URLs
+#   5. Download PDFs
 #
-# Anti-bot notes:
-#   - The AfDB site blocks generic user-agents with 403 Forbidden
-#   - We use a realistic browser User-Agent as override for this source
-#   - If 403 persists, try polite_get() with httr::add_headers(Cookie=...) or
-#     contact idevhelpdesk@afdb.org for bulk data access
+# Document type priority (most → least complete):
+#   1. EER   — Extended/External Evaluation Report (post-completion)
+#   2. PCREN — PCR Evaluation Note
+#   3. PCR   — Project Completion Report
+#   4. MTR / MTEv — Mid-Term Review / Evaluation
+#   5. IPR / ISR  — Implementation Progress / Status Report
+#   6. PAR   — Project Appraisal Report (baseline)
+#   7. ESIA  — Environmental & Social Impact Assessment
 #
-# Document type mapping (AfDB terminology → our standard):
-#   PCR  = Project Completion Report
-#   PAR  = Project Appraisal Report
-#   PCREN = PCR Evaluation Note
-#   ESW  = Economic and Sector Work
-#   Evaluation Report = IDEV independent evaluation
+# Technical notes:
+#   - afdb.org does NOT use Cloudflare — browser UA + gzip-only encoding works
+#   - MapAfrica (mapafrica.afdb.org) is Cloudflare-protected and cannot be
+#     scraped with standard R HTTP libraries; use afdb.org instead
+#   - IDEV portal (idev.afdb.org) has no accessible listing pages (all 404)
+#   - Agriculture sector (tid_1=7) excluded: all AfDB environment projects
+#     already cover agriculture/food systems in Africa
+#   - Doc type is encoded in the title suffix, not a separate field
+#   - HTML structure: Drupal 7 Views Bootstrap grid
 ##############################################################################
 
 # ── Setup ──────────────────────────────────────────────────────────────────
@@ -63,67 +63,118 @@ dir.create(DOWNLOAD_DIR, recursive = TRUE, showWarnings = FALSE)
 SOURCE_NAME <- "afdb"
 
 # ── AfDB Configuration ─────────────────────────────────────────────────────
-AFDB_BASE       <- "https://www.afdb.org"
-IDEV_BASE       <- "https://idev.afdb.org"
+AFDB_BASE      <- "https://www.afdb.org"
+AFDB_DOCS_BASE <- paste0(AFDB_BASE, "/en/all-documents")
+AFDB_DOCS_PER_PAGE <- 18
 
-# Category pages on the main site (Drupal, paginated with ?page=N)
-AFDB_CATEGORIES <- list(
-  pcr      = paste0(AFDB_BASE, "/en/documents/category/project-completion-reports"),
-  par      = paste0(AFDB_BASE, "/en/documents/category/project-appraisal-reports"),
-  pcren    = paste0(AFDB_BASE, "/en/documents/category/project-completion-report-evaluation-notes"),
-  eval     = paste0(AFDB_BASE, "/en/documents/evaluation-reports")
+# Sector filter taxonomy IDs (confirmed from live HTML inspection)
+# Environment = 89 (304 docs), Climate Change = 98 (492 docs)
+# Agriculture (7) excluded: AfDB environment projects already cover it
+AFDB_SECTOR_FILTERS <- list(
+  environment    = list(tid = 89, label = "Environment"),
+  climate_change = list(tid = 98, label = "Climate Change")
 )
 
-# IDEV evaluation pages (separate Drupal site)
-# Candidate URLs tried in order — 404s are skipped automatically
-IDEV_EVALUATIONS_URLS <- c(
-  paste0(IDEV_BASE, "/en/evaluation"),           # most likely correct path
-  paste0(IDEV_BASE, "/en/evaluations"),
-  paste0(IDEV_BASE, "/evaluations"),
-  paste0(IDEV_BASE, "/en/idev-evaluations"),
-  paste0(IDEV_BASE, "/en/publications"),
-  IDEV_BASE                                       # root page as last resort
+# Document type priority (lower = more complete; used for one-per-project selection)
+# Based on AfDB document taxonomy observed in titles
+AFDB_DOC_TYPE_PRIORITY <- c(
+  EER   = 1L,  # Extended/External Evaluation Report (post-completion, most rigorous)
+  PCREN = 2L,  # PCR Evaluation Note
+  PCR   = 3L,  # Project Completion Report (self-assessment)
+  MTR   = 4L,  # Mid-Term Review
+  MTEV  = 4L,  # Mid-Term Evaluation (alternate abbreviation)
+  IPR   = 5L,  # Implementation Progress Report (during implementation)
+  ISR   = 5L,  # Implementation Status Report (during implementation)
+  PAR   = 6L,  # Project Appraisal Report (at approval)
+  ESIA  = 7L   # Environmental & Social Impact Assessment
 )
 
-# AfDB uses a realistic User-Agent because the site blocks generic bots
-# This is used as an override for polite_get calls on this source
+# Browser User-Agent (required: afdb.org checks UA)
 AFDB_BROWSER_UA <- paste0(
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
   "AppleWebKit/537.36 (KHTML, like Gecko) ",
   "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Maximum pages to scrape per category (safety cap)
-AFDB_MAX_PAGES <- 50
+AFDB_MAX_PAGES <- 60  # safety cap per sector (~1080 docs max)
 
-# Known African country names in AfDB document titles (for relevance check)
-# AfDB primarily covers African countries, but we still filter for agriculture/adaptation
-AFDB_REQUIRE_AFRICA  <- FALSE  # AfDB is Africa-focused by definition
-AFDB_REQUIRE_SECTOR  <- TRUE   # Still require agriculture or adaptation keywords
+# AfDB is Africa-focused by mandate; require sector keywords only
+AFDB_REQUIRE_AFRICA  <- FALSE
+AFDB_REQUIRE_SECTOR  <- TRUE
+
+# ── AfDB session handle (persistent cookies across requests) ──────────────
+# The site requires a session cookie set by the homepage before serving
+# filtered document pages. We use a single httr handle (cookie jar) for the
+# entire scraping run and warm it up by visiting the homepage first.
+AFDB_HANDLE <- NULL  # initialised in afdb_init_session()
+
+afdb_init_session <- function() {
+  cli::cli_alert_info("Initialising AfDB session (visiting homepage for cookies)...")
+  AFDB_HANDLE <<- httr::handle(AFDB_BASE)
+
+  resp <- tryCatch(
+    httr::GET(
+      AFDB_BASE,
+      httr::handle(AFDB_HANDLE),
+      httr::user_agent(AFDB_BROWSER_UA),
+      httr::timeout(HTTP_CONFIG$timeout_sec),
+      httr::add_headers(
+        Accept            = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        `Accept-Language` = "en-US,en;q=0.9",
+        `Accept-Encoding` = "gzip, deflate",
+        `Upgrade-Insecure-Requests` = "1",
+        `Sec-Fetch-Dest`  = "document",
+        `Sec-Fetch-Mode`  = "navigate",
+        `Sec-Fetch-Site`  = "none",
+        `Sec-Fetch-User`  = "?1"
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(resp) && httr::status_code(resp) == 200) {
+    cli::cli_alert_success("Session initialised (homepage returned 200)")
+    Sys.sleep(runif(1, 1.5, 3.0))  # brief pause before first document request
+    return(TRUE)
+  }
+  cli::cli_alert_warning("Homepage returned HTTP {httr::status_code(resp)} — session may not work")
+  FALSE
+}
 
 # ── Helper: AfDB-specific polite GET ──────────────────────────────────────
-#' Like polite_get but uses a browser User-Agent to avoid 403s on AfDB.
-afdb_get <- function(url) {
+#' Uses persistent cookie handle + browser UA + gzip-only encoding.
+#' Brotli ('br') is omitted — libcurl on Windows cannot decode it.
+afdb_get <- function(url, referer = AFDB_BASE) {
   Sys.sleep(runif(1, HTTP_CONFIG$delay_min, HTTP_CONFIG$delay_max))
+
   for (attempt in seq_len(HTTP_CONFIG$max_retries)) {
-    resp <- tryCatch(
-      httr::GET(
+    resp <- tryCatch({
+      args <- list(
         url,
         httr::user_agent(AFDB_BROWSER_UA),
         httr::timeout(HTTP_CONFIG$timeout_sec),
         httr::add_headers(
-          Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          `Accept-Language` = "en-US,en;q=0.5",
-          # Omit 'br' (Brotli) — libcurl on Windows does not support it;
-          # without this the server sends Brotli which httr cannot decode.
-          `Accept-Encoding` = "gzip, deflate"
+          Accept            = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          `Accept-Language` = "en-US,en;q=0.9",
+          `Accept-Encoding` = "gzip, deflate",
+          Referer           = referer,
+          `Upgrade-Insecure-Requests` = "1",
+          `Sec-Fetch-Dest`  = "document",
+          `Sec-Fetch-Mode`  = "navigate",
+          `Sec-Fetch-Site`  = "same-origin",
+          `Sec-Fetch-User`  = "?1",
+          `Cache-Control`   = "max-age=0"
         )
-      ),
-      error = function(e) {
-        cli::cli_alert_warning("AfDB GET error (attempt {attempt}): {e$message}")
-        NULL
-      }
-    )
+      )
+      # Attach cookie handle if session was initialised
+      if (!is.null(AFDB_HANDLE)) args <- c(args, list(httr::handle(AFDB_HANDLE)))
+      do.call(httr::GET, args)
+    },
+    error = function(e) {
+      cli::cli_alert_warning("AfDB GET error (attempt {attempt}): {e$message}")
+      NULL
+    })
+
     if (is.null(resp)) { Sys.sleep(2^attempt); next }
     status <- httr::status_code(resp)
     if (status == 200) return(resp)
@@ -135,9 +186,9 @@ afdb_get <- function(url) {
   NULL
 }
 
-# ── Helper: Parse HTML safely using AfDB GET ───────────────────────────────
-afdb_read_html <- function(url) {
-  resp <- afdb_get(url)
+# ── Helper: Read HTML with AfDB GET ───────────────────────────────────────
+afdb_read_html <- function(url, referer = paste0(AFDB_BASE, "/en/documents")) {
+  resp <- afdb_get(url, referer = referer)
   if (is.null(resp) || httr::status_code(resp) != 200) return(NULL)
   tryCatch({
     txt <- httr::content(resp, as = "text", encoding = "UTF-8")
@@ -149,88 +200,95 @@ afdb_read_html <- function(url) {
   })
 }
 
-# ── Helper: Extract documents from a Drupal listing page ──────────────────
-#' Parse a Drupal document listing page into a tibble.
-#' Tries multiple CSS selector patterns to be resilient across Drupal themes.
-parse_afdb_listing <- function(page_html, base_url, doc_type_label) {
+# ── Helper: Parse document type from title suffix ─────────────────────────
+#' AfDB titles embed doc type as " - EER October 2025" or " - IPR novembre 2024"
+#' Returns the type abbreviation in uppercase, or NA if not detected.
+parse_doc_type_from_title <- function(title) {
+  if (is.na(title) || nchar(title) == 0) return(NA_character_)
+  pattern <- "\\b(EER|PCREN|PCR|MTEv|MTEV|MTR|IPR|ISR|PAR|ESIA)\\b"
+  m <- regmatches(title, regexpr(pattern, title, ignore.case = TRUE))
+  if (length(m) == 0 || nchar(m) == 0) return(NA_character_)
+  toupper(m)
+}
+
+# ── Helper: Strip doc type suffix to get project name ────────────────────
+#' Removes " - EER October 2025" style suffix from title to get the base project name.
+#' Used for grouping multiple documents that belong to the same project.
+extract_project_name <- function(title) {
+  if (is.na(title) || nchar(title) == 0) return(NA_character_)
+  # Match " - TYPE [anything to end]"
+  pattern <- "\\s*-\\s*(EER|PCREN|PCR|MTEv|MTEV|MTR|IPR|ISR|PAR|ESIA)(\\s.*)?$"
+  trimws(sub(pattern, "", title, ignore.case = TRUE))
+}
+
+# ── Helper: Parse a single AfDB document listing page ─────────────────────
+#' Uses confirmed Drupal 7 Views Bootstrap grid selectors, with generic fallbacks.
+parse_afdb_listing <- function(page_html, sector_label) {
   if (is.null(page_html)) return(tibble())
 
-  # Try different container selectors used by AfDB/Drupal
-  # Pattern 1: views-row (Drupal 7 Views)
-  # Pattern 2: article.node (Drupal 8+)
-  # Pattern 3: .document-item (custom theme)
+  # Primary selectors (confirmed from live HTML)
   entries <- tryCatch({
-    rows <- rvest::html_elements(page_html, ".views-row, article.node--type-publication, .document-item, li.views-row")
-    if (length(rows) == 0) {
-      # Fallback: any list item or article with an anchor
-      rows <- rvest::html_elements(page_html, "ul.item-list li, .view-content > div")
-    }
+    rows <- rvest::html_elements(page_html, "div.col-xs-12.col-sm-12")
+    if (length(rows) == 0)
+      rows <- rvest::html_elements(page_html, ".views-bootstrap-grid-plugin-style .col-xs-12")
+    if (length(rows) == 0)
+      rows <- rvest::html_elements(page_html, ".views-row, .view-content > div")
     rows
   }, error = function(e) list())
 
   if (length(entries) == 0) {
-    cli::cli_alert_warning("No document entries found on page. Trying link-based extraction.")
-    # Last resort: grab all links that look like document pages
-    links <- rvest::html_elements(page_html, "a[href*='/documents/document'], a[href*='/en/documents/']")
-    if (length(links) == 0) return(tibble())
-
-    hrefs <- rvest::html_attr(links, "href")
-    titles <- rvest::html_text2(links)
-    hrefs <- hrefs[nchar(titles) > 10]  # filter out nav links
-    titles <- titles[nchar(titles) > 10]
-    if (length(hrefs) == 0) return(tibble())
-
-    full_urls <- ifelse(startsWith(hrefs, "http"), hrefs,
-                        paste0(AFDB_BASE, hrefs))
-    return(tibble(
-      id         = safe_filename(titles),
-      title      = titles,
-      pdf_url    = NA_character_,
-      doc_date   = NA_character_,
-      doc_type   = doc_type_label,
-      country    = NA_character_,
-      project_id = NA_character_,
-      web_url    = full_urls
-    ))
+    cli::cli_alert_warning("No document entries found on page.")
+    return(tibble())
   }
 
   records <- purrr::map(entries, function(entry) {
     tryCatch({
-      # Title and web link
-      title_el <- rvest::html_element(entry, "a, h3, h2, .views-field-title")
-      title <- if (!is.na(title_el)) rvest::html_text2(title_el) else NA_character_
-      href  <- if (!is.na(title_el)) rvest::html_attr(title_el, "href") else NA_character_
+      # Title link (confirmed: .views-field-title a)
+      title_el <- rvest::html_element(entry,
+        ".views-field-title a, .field-content a, h3 a, h2 a")
+      if (is.na(title_el)) return(NULL)
 
-      if (is.na(title) || nchar(trimws(title)) == 0) return(NULL)
+      title <- trimws(rvest::html_text2(title_el))
+      href  <- rvest::html_attr(title_el, "href")
+      if (is.na(title) || nchar(title) < 5) return(NULL)
 
       web_url <- if (!is.na(href)) {
-        ifelse(startsWith(href, "http"), href, paste0(AFDB_BASE, href))
+        if (startsWith(href, "http")) href else paste0(AFDB_BASE, href)
       } else NA_character_
 
-      # Date
-      date_el  <- rvest::html_element(entry, ".date-display-single, time, .views-field-created, .field--name-created")
-      doc_date <- if (!is.na(date_el)) rvest::html_text2(date_el) else NA_character_
+      # Date (confirmed: span.date-display-single)
+      date_el  <- rvest::html_element(entry,
+        "span.date-display-single, time, .views-field-created")
+      doc_date <- if (!is.na(date_el)) trimws(rvest::html_text2(date_el)) else NA_character_
 
-      # Direct PDF link (if on listing page)
+      # Standardise date to ISO (AfDB uses "02-Mar-2026" format)
+      doc_date_iso <- tryCatch(
+        format(as.Date(doc_date, format = "%d-%b-%Y"), "%Y-%m-%d"),
+        error = function(e) doc_date
+      )
+
+      # Direct PDF link on listing (rare but possible)
       pdf_el  <- rvest::html_element(entry, "a[href$='.pdf'], a[href$='.PDF']")
       pdf_url <- if (!is.na(pdf_el)) {
-        href_pdf <- rvest::html_attr(pdf_el, "href")
-        ifelse(startsWith(href_pdf, "http"), href_pdf,
-               paste0(AFDB_BASE, href_pdf))
+        h <- rvest::html_attr(pdf_el, "href")
+        if (!is.na(h)) { if (startsWith(h, "http")) h else paste0(AFDB_BASE, h) }
       } else NA_character_
 
-      # Country from text
-      text_full <- rvest::html_text2(entry)
-      country_match <- Filter(function(c) grepl(c, tolower(text_full), fixed = TRUE),
-                              tolower(AFRICA_COUNTRIES_EN))[1]
-      country <- if (length(country_match) > 0) country_match else NA_character_
+      # Country: first Africa country found in title
+      title_lower <- tolower(title)
+      country <- NA_character_
+      for (cn in AFRICA_COUNTRIES_EN) {
+        if (grepl(tolower(cn), title_lower, fixed = TRUE)) {
+          country <- cn; break
+        }
+      }
 
       tibble(
-        id         = safe_filename(paste0(doc_type_label, "_", title)),
-        title      = trimws(title),
+        id         = safe_filename(title),
+        title      = title,
         pdf_url    = pdf_url,
-        doc_date   = trimws(coalesce(doc_date, NA_character_)),
-        doc_type   = doc_type_label,
+        doc_date   = doc_date_iso,
+        doc_type   = sector_label,   # broad sector label (refined later by parse_doc_type_from_title)
         country    = country,
         project_id = NA_character_,
         web_url    = web_url
@@ -241,170 +299,119 @@ parse_afdb_listing <- function(page_html, base_url, doc_type_label) {
   purrr::compact(records) %>% bind_rows()
 }
 
-# ── Helper: Visit a document page to get its PDF URL ─────────────────────
+# ── Helper: Visit a document page to resolve its PDF URL ─────────────────
 resolve_pdf_url <- function(web_url) {
   if (is.na(web_url) || nchar(web_url) == 0) return(NA_character_)
-
   page <- afdb_read_html(web_url)
   if (is.null(page)) return(NA_character_)
-
-  # Look for direct PDF links
-  pdf_links <- rvest::html_elements(page, "a[href$='.pdf'], a[href$='.PDF'], a[href*='fileadmin']")
+  # Look for PDF links (AfDB stores at /fileadmin/uploads/...)
+  pdf_links <- rvest::html_elements(page,
+    "a[href$='.pdf'], a[href$='.PDF'], a[href*='fileadmin']")
   if (length(pdf_links) == 0) return(NA_character_)
-
   href <- rvest::html_attr(pdf_links[[1]], "href")
   if (is.na(href)) return(NA_character_)
-
   if (startsWith(href, "http")) href else paste0(AFDB_BASE, href)
 }
 
-# ── Strategy 1: Scrape IDEV evaluations portal ────────────────────────────
-scrape_idev <- function() {
-  cli::cli_h2("Strategy 1: IDEV Evaluations Portal (idev.afdb.org)")
+# ── Strategy: Scrape all documents by sector ──────────────────────────────
+scrape_afdb_by_sector <- function() {
+  cli::cli_h2("Scraping AfDB documents by sector (Environment + Climate Change)")
   all_results <- tibble()
 
-  # Try each candidate URL until one returns 200
-  idev_base_url <- NULL
-  for (candidate in IDEV_EVALUATIONS_URLS) {
-    cli::cli_alert_info("Trying IDEV URL: {candidate}")
-    resp <- afdb_get(candidate)
-    if (!is.null(resp) && httr::status_code(resp) == 200) {
-      idev_base_url <- candidate
-      cli::cli_alert_success("IDEV accessible at: {candidate}")
-      break
-    } else {
-      status <- if (is.null(resp)) "no response" else httr::status_code(resp)
-      cli::cli_alert_warning("  {status} — trying next...")
-    }
-  }
-
-  if (is.null(idev_base_url)) {
-    cli::cli_alert_warning("IDEV portal not accessible — skipping.")
-    return(tibble())
-  }
-
-  for (page_num in 0:AFDB_MAX_PAGES) {
-    url <- if (page_num == 0) idev_base_url else
-      paste0(idev_base_url, "?page=", page_num)
-
-    cli::cli_alert_info("IDEV page {page_num}: {url}")
-    page_html <- afdb_read_html(url)
-
-    if (is.null(page_html)) {
-      cli::cli_alert_warning("Could not fetch IDEV page {page_num}, stopping.")
-      break
-    }
-
-    records <- parse_afdb_listing(page_html, IDEV_BASE, "Evaluation Report")
-
-    if (nrow(records) == 0) {
-      cli::cli_alert_info("No more entries at IDEV page {page_num}, stopping.")
-      break
-    }
-
-    # Fix relative links to use IDEV base
-    records <- records %>%
-      mutate(web_url = ifelse(!is.na(web_url) & startsWith(web_url, AFDB_BASE),
-                              sub(AFDB_BASE, IDEV_BASE, web_url, fixed = TRUE),
-                              web_url))
-
-    all_results <- bind_rows(all_results, records)
-    cli::cli_alert_success("IDEV page {page_num}: {nrow(records)} documents found")
-
-    next_link <- rvest::html_element(page_html, "a[rel='next'], .pager__item--next a, li.next a")
-    if (is.na(next_link)) break
-  }
-
-  cli::cli_alert_success("IDEV total: {nrow(all_results)} documents found")
-  all_results
-}
-
-# ── Strategy 2: Scrape AfDB category pages ────────────────────────────────
-scrape_afdb_categories <- function() {
-  cli::cli_h2("Strategy 2: AfDB Category Pages (afdb.org)")
-  all_results <- tibble()
-
-  for (cat_name in names(AFDB_CATEGORIES)) {
-    base_url    <- AFDB_CATEGORIES[[cat_name]]
-    doc_label   <- switch(cat_name,
-      pcr   = "Project Completion Report",
-      par   = "Project Appraisal Report",
-      pcren = "PCR Evaluation Note",
-      eval  = "Evaluation Report",
-      cat_name
-    )
-
-    cli::cli_alert_info("Category: {cat_name} ({doc_label})")
+  for (sector_name in names(AFDB_SECTOR_FILTERS)) {
+    tid   <- AFDB_SECTOR_FILTERS[[sector_name]]$tid
+    label <- AFDB_SECTOR_FILTERS[[sector_name]]$label
+    cli::cli_alert_info("Sector: {label} (tid_1={tid})")
 
     for (page_num in 0:AFDB_MAX_PAGES) {
-      url <- if (page_num == 0) base_url else paste0(base_url, "?page=", page_num)
+      url <- paste0(AFDB_DOCS_BASE, "?tid_1=", tid, "&page=", page_num)
       page_html <- afdb_read_html(url)
 
       if (is.null(page_html)) {
-        cli::cli_alert_warning("  Could not fetch {cat_name} page {page_num} — skipping.")
+        cli::cli_alert_warning("  Could not fetch {label} page {page_num} — stopping sector.")
         break
       }
 
-      records <- parse_afdb_listing(page_html, AFDB_BASE, doc_label)
+      records <- parse_afdb_listing(page_html, label)
 
       if (nrow(records) == 0) {
-        cli::cli_alert_info("  No entries on page {page_num}, moving to next category.")
+        cli::cli_alert_info("  No entries on page {page_num} — end of {label} listing.")
         break
       }
 
       all_results <- bind_rows(all_results, records)
-      cli::cli_alert_success("  Page {page_num}: {nrow(records)} documents")
+      cli::cli_alert_success("  Page {page_num}: {nrow(records)} entries (total so far: {nrow(all_results)})")
 
-      # Check for next page
-      next_link <- rvest::html_element(page_html, "a[rel='next'], .pager__item--next a, li.next a")
-      if (is.na(next_link)) break
+      # Check for "next page" pager link
+      next_link <- rvest::html_element(page_html,
+        "a[rel='next'], .pager__item--next a, li.pager-next a, li.next a")
+      if (is.na(next_link)) {
+        cli::cli_alert_info("  No next-page link found — end of {label} listing.")
+        break
+      }
     }
   }
 
-  cli::cli_alert_success("AfDB categories total: {nrow(all_results)} documents found")
+  cli::cli_alert_success("Total scraped: {nrow(all_results)} documents across all sectors")
   all_results
 }
 
-# ── Resolve missing PDF URLs by visiting document pages ───────────────────
-enrich_pdf_urls <- function(results) {
-  cli::cli_h2("Resolving PDF URLs for documents without direct links")
+# ── One document per project: select highest-priority type ────────────────
+#' Groups by extracted project name, keeps the most complete document type.
+#' Within the same type, keeps the most recent document.
+select_best_document <- function(results) {
+  if (nrow(results) == 0) return(results)
 
-  needs_pdf <- results %>% filter(is.na(pdf_url) & !is.na(web_url))
-  has_pdf   <- results %>% filter(!is.na(pdf_url) | is.na(web_url))
+  cli::cli_h2("Selecting one document per project (priority ranking)")
 
-  cli::cli_alert_info("{nrow(needs_pdf)} documents need PDF URL resolution")
+  results <- results %>%
+    mutate(
+      doc_type_abbr = sapply(title, parse_doc_type_from_title),
+      project_name  = sapply(title, extract_project_name),
+      type_priority = {
+        p <- AFDB_DOC_TYPE_PRIORITY[doc_type_abbr]
+        ifelse(is.na(p), 99L, as.integer(p))
+      }
+    )
 
-  if (nrow(needs_pdf) == 0) return(results)
+  # Count before selection
+  n_total    <- nrow(results)
+  n_projects <- dplyr::n_distinct(results$project_name)
+  cli::cli_alert_info("Before: {n_total} documents, {n_projects} distinct projects")
 
-  resolved <- needs_pdf %>%
-    rowwise() %>%
-    mutate(pdf_url = {
-      cli::cli_alert_info("  Resolving: {substr(title, 1, 60)}")
-      resolve_pdf_url(web_url)
-    }) %>%
-    ungroup()
+  # Show doc type distribution
+  type_dist <- results %>% count(doc_type_abbr, sort = TRUE)
+  cli::cli_alert_info("Doc type breakdown:")
+  for (i in seq_len(nrow(type_dist))) {
+    cli::cli_text("  {type_dist$doc_type_abbr[i]}: {type_dist$n[i]}")
+  }
 
-  bind_rows(has_pdf, resolved)
+  # Select one per project
+  best <- results %>%
+    group_by(project_name) %>%
+    arrange(type_priority, desc(doc_date)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(-type_priority)
+
+  cli::cli_alert_success("After selection: {nrow(best)} documents (one per project)")
+  best
 }
 
 # ── Relevance filtering ────────────────────────────────────────────────────
 filter_relevant <- function(results) {
-  cli::cli_h2("Filtering for relevance (agriculture + adaptation)")
-
+  cli::cli_h2("Filtering for relevance (agriculture/adaptation keywords)")
   if (nrow(results) == 0) return(results)
 
-  # Deduplicate by web_url first, then by title
   results <- results %>%
     distinct(web_url, .keep_all = TRUE) %>%
     distinct(title, .keep_all = TRUE)
-
   cli::cli_alert_info("After dedup: {nrow(results)} documents")
 
-  # AfDB is Africa-focused, so we skip Africa requirement and focus on sector
   results %>%
     rowwise() %>%
     mutate(relevant = passes_relevance_fast(
-      paste(coalesce(title, ""), coalesce(doc_type, ""), sep = " "),
+      paste(coalesce(title, ""), coalesce(project_name, ""), sep = " "),
       require_africa = AFDB_REQUIRE_AFRICA,
       require_sector = AFDB_REQUIRE_SECTOR
     )) %>%
@@ -413,14 +420,32 @@ filter_relevant <- function(results) {
     select(-relevant)
 }
 
+# ── Resolve missing PDF URLs ───────────────────────────────────────────────
+enrich_pdf_urls <- function(results) {
+  cli::cli_h2("Resolving PDF URLs (visiting document pages)")
+  needs_pdf <- results %>% filter(is.na(pdf_url) & !is.na(web_url))
+  has_pdf   <- results %>% filter(!is.na(pdf_url) | is.na(web_url))
+  cli::cli_alert_info("{nrow(needs_pdf)} documents need PDF URL resolution")
+  if (nrow(needs_pdf) == 0) return(results)
+
+  resolved <- needs_pdf %>%
+    rowwise() %>%
+    mutate(pdf_url = {
+      cli::cli_alert_info("  {substr(title, 1, 65)}")
+      resolve_pdf_url(web_url)
+    }) %>%
+    ungroup()
+
+  bind_rows(has_pdf, resolved)
+}
+
 # ── Download PDFs ─────────────────────────────────────────────────────────
 download_results <- function(results) {
   cli::cli_h2("Downloading PDFs")
-
   with_pdf <- results %>% filter(!is.na(pdf_url) & nchar(pdf_url) > 0)
   cli::cli_alert_info("{nrow(with_pdf)} documents have PDF URLs")
 
-  success <- 0; failed <- 0; skipped <- 0
+  success <- 0L; failed <- 0L; skipped <- 0L
 
   for (i in seq_len(nrow(with_pdf))) {
     row <- with_pdf[i, ]
@@ -429,21 +454,23 @@ download_results <- function(results) {
       format(as.Date(row$doc_date), "%Y"),
       error = function(e) "XXXX"
     )
-    fname <- glue("{SOURCE_NAME}_{safe_filename(coalesce(row$doc_type, 'doc'))}_{safe_filename(coalesce(row$title, 'notitle'))}_{year}.pdf")
-    # Truncate to safe length
-    fname <- paste0(substr(fname, 1, 150), ".pdf")
-    dest  <- file.path(DOWNLOAD_DIR, fname)
+    type_str <- safe_filename(coalesce(row$doc_type_abbr, "doc"))
+    proj_str <- safe_filename(coalesce(row$project_name, coalesce(row$title, "notitle")))
+    fname <- paste0(substr(
+      glue("{SOURCE_NAME}_{type_str}_{proj_str}_{year}"),
+      1, 150), ".pdf")
+    dest <- file.path(DOWNLOAD_DIR, fname)
 
     if (file.exists(dest)) {
-      log_download(SOURCE_NAME, row$project_id, row$doc_type,
-                   row$title, row$pdf_url, dest, "skipped", "File already exists")
-      skipped <- skipped + 1
+      log_download(SOURCE_NAME, row$project_id, row$doc_type_abbr,
+                   row$title, row$pdf_url, dest, "skipped", "Already exists")
+      skipped <- skipped + 1L
       next
     }
 
-    # Use afdb_get for download (browser UA)
-    resp <- afdb_get(row$pdf_url)
+    resp  <- afdb_get(row$pdf_url)
     dl_ok <- FALSE
+
     if (!is.null(resp) && httr::status_code(resp) == 200) {
       tryCatch({
         dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
@@ -462,16 +489,18 @@ download_results <- function(results) {
     }
 
     if (dl_ok) {
-      log_download(SOURCE_NAME, row$project_id, row$doc_type,
+      log_download(SOURCE_NAME, row$project_id, row$doc_type_abbr,
                    row$title, row$pdf_url, dest, "success")
-      success <- success + 1
+      success <- success + 1L
     } else {
-      log_download(SOURCE_NAME, row$project_id, row$doc_type,
-                   row$title, row$pdf_url, dest, "failed", "Download or PDF validation failed")
-      failed <- failed + 1
+      log_download(SOURCE_NAME, row$project_id, row$doc_type_abbr,
+                   row$title, row$pdf_url, dest, "failed",
+                   "Download or PDF validation failed")
+      failed <- failed + 1L
     }
 
-    if (i %% 10 == 0) cli::cli_alert_info("Progress: {i}/{nrow(with_pdf)} (OK:{success} fail:{failed} skip:{skipped})")
+    if (i %% 10 == 0)
+      cli::cli_alert_info("Progress: {i}/{nrow(with_pdf)} (OK:{success} fail:{failed} skip:{skipped})")
   }
 
   cli::cli_h3("Download Summary")
@@ -492,46 +521,48 @@ save_metadata <- function(results) {
 run_afdb_scraper <- function() {
   cli::cli_h1("AfDB Grey Literature Scraper")
   cli::cli_alert_info("Download dir: {DOWNLOAD_DIR}")
-  cli::cli_alert_info("Note: AfDB blocks generic user-agents; using browser UA override.")
 
-  # Collect from both strategies
-  idev_results  <- tryCatch(scrape_idev(), error = function(e) {
-    cli::cli_alert_danger("IDEV strategy failed: {e$message}")
+  # Step 0: Warm up session (get homepage cookies)
+  afdb_init_session()
+
+  # Step 1: Collect all documents from Environment + Climate Change sectors
+  all_docs <- tryCatch(scrape_afdb_by_sector(), error = function(e) {
+    cli::cli_alert_danger("Scraping failed: {e$message}")
     tibble()
   })
 
-  afdb_results  <- tryCatch(scrape_afdb_categories(), error = function(e) {
-    cli::cli_alert_danger("AfDB categories strategy failed: {e$message}")
-    tibble()
-  })
-
-  all_results <- bind_rows(idev_results, afdb_results)
-  cli::cli_alert_info("Total raw: {nrow(all_results)} documents")
-
-  if (nrow(all_results) == 0) {
-    cli::cli_alert_danger("No documents found. The site may be blocking all requests.")
-    cli::cli_alert_info("Consider: contacting idevhelpdesk@afdb.org for bulk data access.")
+  if (nrow(all_docs) == 0) {
+    cli::cli_alert_danger("No documents found. Check network and URL structure.")
     return(invisible(NULL))
   }
 
-  # Filter for relevance
-  relevant <- filter_relevant(all_results)
+  # Step 2: Deduplicate + relevance filter
+  relevant <- filter_relevant(all_docs)
   cli::cli_alert_info("After relevance filter: {nrow(relevant)} documents")
 
-  # Resolve any missing PDF URLs (visit document pages)
-  relevant <- enrich_pdf_urls(relevant)
+  if (nrow(relevant) == 0) {
+    cli::cli_alert_warning("No documents passed relevance filter.")
+    save_metadata(relevant)
+    return(invisible(NULL))
+  }
 
-  # Save metadata
-  save_metadata(relevant)
+  # Step 3: One document per project
+  best <- select_best_document(relevant)
 
-  # Download PDFs
-  download_results(relevant)
+  # Step 4: Resolve PDF URLs
+  best <- enrich_pdf_urls(best)
 
-  # Summary
+  # Step 5: Save metadata
+  save_metadata(best)
+
+  # Step 6: Download PDFs
+  download_results(best)
+
+  # Step 7: Summary
   print_source_summary(SOURCE_NAME)
 
   cli::cli_h2("Done!")
-  invisible(relevant)
+  invisible(best)
 }
 
 # Run if called directly
